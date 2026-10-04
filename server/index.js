@@ -7,7 +7,8 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { createServer } from 'node:http';
 import { createAccessToken, createRefreshToken, getBearerToken, hashPassword, hashRefreshToken, parseCookies, refreshCookieOptions, refreshExpiry, signEvent, verifyAccessToken, verifyEventSignature, verifyPassword, clearRefreshCookieOptions } from './security.js';
-import { closeStore, createDeal, createEvent, createUser, findUserByEmail, findUserById, getDeal, getRefreshToken, initStore, listDealsForUser, listEvents, revokeRefreshToken, saveRefreshToken, storeMode, updateDealStatus } from './store.js';
+import { claimStripeEvent, closeStore, completeStripeEvent, createDeal, createEvent, createUser, findUserByEmail, findUserById, getDeal, getRefreshToken, initStore, listDealsForUser, listEvents, releaseStripeEvent, revokeRefreshToken, saveRefreshToken, storeMode, updateDealStatus } from './store.js';
+import { checkoutUrls, constructWebhookEvent, createCheckoutSession, stripeMode } from './stripe.js';
 
 const app = express();
 const projectRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -19,8 +20,54 @@ const eventStatus = { payment_confirmed: 'in_review', proof_submitted: 'in_revie
 app.disable('x-powered-by');
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigin === '*' || origin === allowedOrigin), credentials: true }));
+
+// Stripe requires the exact raw body for signature verification. Keep this route before express.json().
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json', limit: '256kb' }), async (req, res, next) => {
+  try {
+    const event = constructWebhookEvent(req.body, req.headers['stripe-signature']);
+    const firstDelivery = await claimStripeEvent(event.id, event.type, event);
+    if (!firstDelivery) return res.json({ received: true, duplicate: true });
+
+    try {
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const dealId = session.metadata?.dealId || session.client_reference_id;
+        const deal = dealId && await getDeal(dealId);
+        if (deal && session.payment_status === 'paid') {
+          await appendSystemEvent(deal, 'payment_confirmed', {
+            provider: 'stripe',
+            mode: stripeMode(),
+            checkoutSessionId: session.id,
+            paymentIntentId: session.payment_intent || null,
+            amountMinor: session.amount_total,
+            currency: session.currency
+          });
+        }
+      } else if (event.type === 'payment_intent.payment_failed') {
+        const intent = event.data.object;
+        const dealId = intent.metadata?.dealId;
+        const deal = dealId && await getDeal(dealId);
+        if (deal) await appendSystemEvent(deal, 'review_note', { provider: 'stripe', status: 'payment_failed', paymentIntentId: intent.id });
+      }
+      await completeStripeEvent(event.id);
+      return res.json({ received: true, duplicate: false });
+    } catch (processingError) {
+      await releaseStripeEvent(event.id);
+      throw processingError;
+    }
+  } catch (error) {
+    if (error.code === 'STRIPE_SIGNATURE_INVALID') return errorResponse(res, 400, 'INVALID_STRIPE_SIGNATURE', error.message);
+    if (error.code === 'STRIPE_NOT_CONFIGURED') return errorResponse(res, 503, 'STRIPE_NOT_CONFIGURED', error.message);
+    return next(error);
+  }
+});
+
 app.use(express.json({ limit: '100kb' }));
-app.use(express.static('.'));
+const publicFiles = ['index.html', 'styles.css', 'app.js', 'api-client.js'];
+for (const publicFile of publicFiles) {
+  app.get(`/${publicFile}`, (req, res) => res.sendFile(path.join(projectRoot, publicFile)));
+}
+app.get('/', (req, res) => res.sendFile(path.join(projectRoot, 'index.html')));
 
 function errorResponse(res, status, code, message, details) { return res.status(status).json({ error: { code, message, ...(details ? { details } : {}) } }); }
 function requireFields(body, fields) { return fields.filter((field) => body[field] === undefined || body[field] === null || body[field] === ''); }
@@ -53,7 +100,15 @@ async function appendEvent(deal, user, type, payload = {}) {
   return saved;
 }
 
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'vachan-api', version: '2.0.0', storage: storeMode(), time: new Date().toISOString() }));
+async function appendSystemEvent(deal, type, payload = {}) {
+  const event = { id: crypto.randomUUID(), dealId: deal.id, actorId: null, type, payload: { ...payload, actor: 'system' }, createdAt: new Date().toISOString() };
+  event.signature = signEvent(canonicalEvent(event));
+  const saved = await createEvent(event);
+  if (eventStatus[type]) await updateDealStatus(deal.id, eventStatus[type]);
+  return saved;
+}
+
+app.get('/api/health', (req, res) => res.json({ ok: true, service: 'vachan-api', version: '2.1.0', storage: storeMode(), payments: stripeMode(), time: new Date().toISOString() }));
 
 app.post('/api/auth/register', async (req, res, next) => {
   try {
@@ -171,6 +226,22 @@ app.post('/api/payments/intents', authRequired, async (req, res, next) => {
     const event = await appendEvent(deal, req.user, 'payment_intent_created', { paymentIntentId, mode: 'demo', upiUri });
     return res.status(201).json({ mode: 'demo', paymentIntentId, upiUri, event });
   } catch (error) { next(error); }
+});
+
+app.post('/api/payments/stripe/checkout-sessions', authRequired, async (req, res, next) => {
+  try {
+    const deal = await getDeal(req.body?.dealId);
+    if (!deal || !accessFor(deal, req.user)) return errorResponse(res, 404, 'DEAL_NOT_FOUND', 'Deal not found.');
+    if (deal.currency !== 'INR') return errorResponse(res, 400, 'UNSUPPORTED_CURRENCY', 'Stripe Checkout currently supports INR deals only.');
+    const session = await createCheckoutSession({ deal, user: req.user });
+    const event = await appendEvent(deal, req.user, 'payment_intent_created', {
+      provider: 'stripe', mode: stripeMode(), checkoutSessionId: session.id, amountMinor: deal.amountMinor, currency: deal.currency
+    });
+    return res.status(201).json({ provider: 'stripe', mode: stripeMode(), sessionId: session.id, url: session.url, event });
+  } catch (error) {
+    if (error.code === 'STRIPE_NOT_CONFIGURED') return errorResponse(res, 503, 'STRIPE_NOT_CONFIGURED', error.message);
+    next(error);
+  }
 });
 
 app.post('/api/webhooks/upi', async (req, res, next) => {
