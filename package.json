@@ -1,0 +1,9 @@
+{
+  "name": "vachan",
+  "version": "1.0.0",
+  "private": true,
+  "description": "India-first milestone trust layer for UPI-based work",
+  "scripts": {
+    "check": "node --check app.js"
+  }
+}
