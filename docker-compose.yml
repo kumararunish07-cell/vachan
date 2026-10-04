@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: vachan
+      POSTGRES_USER: vachan
+      POSTGRES_PASSWORD: vachan_dev_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - vachan_pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+  api:
+    build: .
+    depends_on:
+      - db
+    environment:
+      NODE_ENV: development
+      PORT: 4173
+      DATABASE_URL: postgres://vachan:vachan_dev_only@db:5432/vachan
+      JWT_SECRET: local-development-jwt-secret-change-me
+      EVENT_SIGNING_SECRET: local-development-event-secret-change-me
+      CORS_ORIGIN: http://localhost:4173
+    ports:
+      - "4173:4173"
+volumes:
+  vachan_pgdata:
