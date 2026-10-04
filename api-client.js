@@ -30,6 +30,7 @@ class VachanAPI {
   async getDeal(id) { return this.request(`/api/deals/${encodeURIComponent(id)}`); }
   async appendEvent(id, type, payload = {}) { return this.request(`/api/deals/${encodeURIComponent(id)}/events`, { method: 'POST', body: JSON.stringify({ type, payload }) }); }
   async createDemoPaymentIntent(dealId) { return this.request('/api/payments/intents', { method: 'POST', body: JSON.stringify({ dealId }) }); }
+  async createStripeCheckoutSession(dealId) { return this.request('/api/payments/stripe/checkout-sessions', { method: 'POST', body: JSON.stringify({ dealId }) }); }
 }
 
 window.VachanAPI = VachanAPI;
