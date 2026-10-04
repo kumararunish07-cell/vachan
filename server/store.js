@@ -5,7 +5,7 @@ import pg from 'pg';
 
 const { Pool } = pg;
 let pool = null;
-const memory = { users: new Map(), deals: new Map(), events: new Map(), refreshTokens: new Map() };
+const memory = { users: new Map(), deals: new Map(), events: new Map(), refreshTokens: new Map(), stripeEvents: new Set() };
 
 export async function initStore() {
   if (!process.env.DATABASE_URL) return { mode: 'memory' };
@@ -92,6 +92,26 @@ export async function createEvent(event) {
 export async function listEvents(dealId) {
   if (!pool) return (memory.events.get(dealId) || []).sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   return (await pool.query('SELECT * FROM deal_events WHERE deal_id = $1 ORDER BY created_at ASC', [dealId])).rows.map(pgEvent);
+}
+
+export async function claimStripeEvent(eventId, eventType, payload) {
+  if (!pool) {
+    if (memory.stripeEvents.has(eventId)) return false;
+    memory.stripeEvents.add(eventId);
+    return true;
+  }
+  const result = await pool.query('INSERT INTO stripe_webhook_events (event_id, event_type, payload, status) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING RETURNING event_id', [eventId, eventType, payload, 'processing']);
+  return result.rowCount === 1;
+}
+
+export async function completeStripeEvent(eventId) {
+  if (!pool) return;
+  await pool.query('UPDATE stripe_webhook_events SET status = $2, processed_at = now() WHERE event_id = $1', [eventId, 'processed']);
+}
+
+export async function releaseStripeEvent(eventId) {
+  if (!pool) { memory.stripeEvents.delete(eventId); return; }
+  await pool.query('DELETE FROM stripe_webhook_events WHERE event_id = $1 AND status = $2', [eventId, 'processing']);
 }
 
 export async function closeStore() { if (pool) await pool.end(); }
