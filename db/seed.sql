@@ -1,0 +1,2 @@
+-- Run after schema.sql. The API also works without seed data using its in-memory development store.
+-- Production environments should create users through the API, never through this file.
