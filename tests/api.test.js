@@ -6,6 +6,8 @@ process.env.JWT_SECRET = 'test-jwt-secret-with-enough-entropy';
 process.env.EVENT_SIGNING_SECRET = 'test-event-secret-with-enough-entropy';
 process.env.NODE_ENV = 'test';
 process.env.PORT = '0';
+delete process.env.STRIPE_SECRET_KEY;
+delete process.env.STRIPE_WEBHOOK_SECRET;
 
 const { server } = await import('../server/index.js');
 await once(server, 'listening');
@@ -21,6 +23,7 @@ test('health reports the API and storage mode', async () => {
   assert.equal(response.status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.service, 'vachan-api');
+  assert.equal(body.payments, 'disabled');
 });
 
 test('register, create a deal, append an event, and verify the timeline signature', async () => {
@@ -37,6 +40,10 @@ test('register, create a deal, append an event, and verify the timeline signatur
   assert.equal(timeline.response.status, 200);
   assert.equal(timeline.body.events.length, 2);
   assert.equal(timeline.body.events.every((event) => event.signatureValid), true);
+
+  const checkout = await json('/api/payments/stripe/checkout-sessions', { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: JSON.stringify({ dealId }) });
+  assert.equal(checkout.response.status, 503);
+  assert.equal(checkout.body.error.code, 'STRIPE_NOT_CONFIGURED');
 });
 
 test('protected routes reject anonymous requests', async () => {
